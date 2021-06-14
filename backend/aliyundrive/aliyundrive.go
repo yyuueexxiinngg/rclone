@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/K265/aliyundrive-go/pkg/aliyun/drive"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -423,18 +425,36 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return o.fs.srv.Open(ctx, o.info, headers)
 }
 
+const rapidUploadLimit = 50 * 1024 * 1024 // 50 MB
+
 // Update in to the object with the modTime given of the given size
 //
 // When called from outside an Fs by rclone, src.Size() will always be >= 0.
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	sha1Code := ""
+	proofCode := ""
+	fileSize := src.Size()
+	localObj, ok := src.(*local.Object)
+	if ok && fileSize > rapidUploadLimit {
+		localRoot := localObj.Fs().Root()[4:]
+		localRemote := localObj.Remote()
+		localPath := path.Join(localRoot, localRemote)
+		fd, err := os.Open(localPath)
+		if err == nil {
+			_, sha1Code, _ = drive.CalcSha1(fd)
+			_, proofCode, _ = o.fs.srv.CalcProof(fileSize, fd)
+			_ = fd.Close()
+		}
+	}
+
 	p := path.Join(o.fs.root, o.Remote())
 	if cErr := checkPathLength(p); cErr != nil {
 		return cErr
 	}
 
-	node, err := o.fs.srv.CreateFile(ctx, p, src.Size(), in, true)
+	node, err := o.fs.srv.CreateFileWithProof(ctx, p, src.Size(), in, sha1Code, proofCode, true)
 	if err != nil {
 		return err
 	}
