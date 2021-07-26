@@ -38,6 +38,10 @@ func init() {
 you can find this by executing localStorage.token in the Chrome console`,
 			Required: true,
 		}, {
+			Name:    "is_album",
+			Help:    "for aliyun drive albums",
+			Default: false,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -49,6 +53,7 @@ you can find this by executing localStorage.token in the Chrome console`,
 // Options defines the configuration for this backend
 type Options struct {
 	RefreshToken string `config:"refresh_token"`
+	IsAlbum      bool   `config:"is_album"`
 }
 
 // Fs represents a remote aliyundrive server
@@ -81,6 +86,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	conf := &drive.Config{
 		RefreshToken: opt.RefreshToken,
+		IsAlbum:      opt.IsAlbum,
 	}
 
 	srv, err := drive.NewFs(ctx, conf)
