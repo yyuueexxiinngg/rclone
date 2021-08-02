@@ -67,6 +67,11 @@ type Fs struct {
 	srv      drive.Fs       // the connection to the aliyundrive api
 }
 
+// absPath return absolute path of remote
+func (f *Fs) absPath(remote string) string {
+	return path.Join("/", f.root, remote)
+}
+
 // Object describes a aliyundrive object
 type Object struct {
 	fs     *Fs    // what this object is part of
@@ -154,7 +159,7 @@ func getNodeModTime(node *drive.Node) time.Time {
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	nodes, err := f.srv.List(ctx, path.Join(f.root, dir))
+	nodes, err := f.srv.List(ctx, f.absPath(dir))
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -179,7 +184,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	node, err := f.srv.Get(ctx, path.Join(f.root, remote), drive.AnyKind)
+	node, err := f.srv.Get(ctx, f.absPath(remote), drive.AnyKind)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +234,7 @@ func checkPathLength(name string) (err error) {
 //
 // Shouldn't return an error if it already exists
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	p := path.Join(f.root, dir)
+	p := f.absPath(dir)
 	if cErr := checkPathLength(p); cErr != nil {
 		return cErr
 	}
@@ -241,7 +246,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 //
 // Return an error if it doesn't exist or isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	node, err := f.srv.Get(ctx, path.Join(f.root, dir), drive.FolderKind)
+	node, err := f.srv.Get(ctx, f.absPath(dir), drive.FolderKind)
 	if err != nil {
 		return errors.Wrap(err, "Rmdir error")
 	}
@@ -264,20 +269,22 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fs.ErrorCantCopy
 	}
 
-	parent, err := f.srv.CreateFolder(ctx, path.Dir(path.Join(f.root, remote)))
+	dstPath := f.absPath(remote)
+	dstParent, err := f.srv.CreateFolder(ctx, path.Dir(dstPath))
 	if err != nil {
 		fs.Debugf(src, "Can't copy - can't create or find remote node")
 		return nil, fs.ErrorCantCopy
 	}
 
-	err = f.srv.Copy(ctx, srcObj.info, parent)
+	dstName := path.Base(dstPath)
+	err = f.srv.Copy(ctx, srcObj.info, dstParent, dstName)
 	if err != nil {
 		return nil, errors.Wrap(err, "Copy error")
 	}
 
-	copiedNode, err := f.srv.Get(ctx, path.Join(f.root, remote), drive.FileKind)
+	copiedNode, err := f.srv.Get(ctx, dstPath, drive.FileKind)
 	if err != nil {
-		return nil, errors.Wrap(err, "Copy error")
+		return nil, errors.Wrap(err, "Copy error, failed to get copied node")
 	}
 
 	dstObj := &Object{
@@ -304,20 +311,22 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fs.ErrorCantMove
 	}
 
-	parent, err := f.srv.CreateFolder(ctx, path.Dir(path.Join(f.root, remote)))
+	dstPath := f.absPath(remote)
+	parent, err := f.srv.CreateFolder(ctx, path.Dir(dstPath))
 	if err != nil {
 		fs.Debugf(src, "Can't move - can't create or find remote node")
 		return nil, fs.ErrorCantMove
 	}
 
-	err = f.srv.Move(ctx, srcObj.info, parent)
+	dstName := path.Base(dstPath)
+	err = f.srv.Move(ctx, srcObj.info, parent, dstName)
 	if err != nil {
 		return nil, errors.Wrap(err, "Move error")
 	}
 
-	movedNode, err := f.srv.Get(ctx, path.Join(f.root, remote), drive.FileKind)
+	movedNode, err := f.srv.Get(ctx, dstPath, drive.FileKind)
 	if err != nil {
-		return nil, errors.Wrap(err, "Move error")
+		return nil, errors.Wrap(err, "Move error, failed to get moved node")
 	}
 
 	dstObj := &Object{
@@ -343,36 +352,26 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return fs.ErrorCantDirMove
 	}
 
-	srcNode, err := f.srv.Get(ctx, path.Join(srcFs.root, srcRemote), drive.FolderKind)
+	srcPath := srcFs.absPath(srcRemote)
+	srcNode, err := f.srv.Get(ctx, srcPath, drive.FolderKind)
 	if err != nil {
 		fs.Debugf(src, "Can't move directory - can't find srcNode")
 		return fs.ErrorCantDirMove
 	}
 
-	srcPath := path.Join(srcFs.root, srcRemote)
-	dstPath := path.Join(f.root, dstRemote)
-	srcParentPath := path.Dir(srcPath)
-	dstParentPath := path.Dir(dstPath)
-	if srcParentPath == dstParentPath {
-		// rename instead of moving
-		err = f.srv.Rename(ctx, srcNode, strings.TrimPrefix(dstPath, dstParentPath+"/"))
-		if err != nil {
-			return errors.Wrap(err, "DirMove error")
-		}
-
-		return nil
-	}
-
-	dstNode, err := f.srv.Get(ctx, dstParentPath, drive.FolderKind)
+	dstPath := f.absPath(dstRemote)
+	parent, err := f.srv.CreateFolder(ctx, path.Dir(dstPath))
 	if err != nil {
-		fs.Debugf(src, "Can't move directory - can't find dstNode")
-		return fs.ErrorCantDirMove
+		fs.Debugf(src, "Can't move - can't create or find remote node")
+		return fs.ErrorCantMove
 	}
 
-	err = f.srv.Move(ctx, srcNode, dstNode)
+	dstName := path.Base(dstPath)
+	err = f.srv.Move(ctx, srcNode, parent, dstName)
 	if err != nil {
-		return errors.Wrap(err, "DirMove error")
+		return errors.Wrap(err, "Move error")
 	}
+
 	return nil
 }
 
@@ -457,7 +456,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 
-	p := path.Join(o.fs.root, o.Remote())
+	p := o.fs.absPath(o.Remote())
 	if cErr := checkPathLength(p); cErr != nil {
 		return cErr
 	}
