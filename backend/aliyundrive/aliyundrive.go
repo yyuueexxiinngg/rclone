@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -111,6 +112,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
+
+	if f.root == "/" {
+		return f, nil
+	}
+	// refer from https://github.com/rclone/rclone/blob/v1.56.0/backend/local/local.go#L286
+	// Check to see if this points to a file
+	node, err := f.wrappedGet(ctx, f.root, drive.AnyKind)
+	if err == nil && !node.IsDirectory() {
+		// It is a file, so use the parent as the root
+		f.root = filepath.Dir(f.root)
+		// return an error with an fs which points to the parent
+		return f, fs.ErrorIsFile
+	}
+
 	return f, nil
 }
 
@@ -160,6 +175,7 @@ func getNodeModTime(node *drive.Node) time.Time {
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	nodes, err := f.srv.List(ctx, f.absPath(dir))
+	fs.Debugf(nil, "aliyundrive list - path: %q, error: %v ", dir, err)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -184,7 +200,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	node, err := f.srv.Get(ctx, f.absPath(remote), drive.AnyKind)
+	node, err := f.wrappedGet(ctx, f.absPath(remote), drive.AnyKind)
 	if err != nil {
 		return nil, err
 	}
@@ -194,6 +210,15 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		info:   node,
 	}
 	return o, nil
+}
+
+func (f *Fs) wrappedGet(ctx context.Context, path string, kind string) (*drive.Node, error) {
+	node, err := f.srv.Get(ctx, path, kind)
+	fs.Debugf(nil, "aliyundrive get - path: %q, kind: %s, error: %v", path, kind, err)
+	if err != nil && errors.Is(err, os.ErrNotExist) {
+		return nil, fs.ErrorObjectNotFound
+	}
+	return node, err
 }
 
 // Put in to the remote path with the modTime given of the given size
@@ -239,6 +264,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		return cErr
 	}
 	_, err := f.srv.CreateFolder(ctx, p)
+	fs.Debugf(nil, "aliyundrive mkdir - path: %q, error: %v", dir, err)
 	return err
 }
 
@@ -246,11 +272,13 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 //
 // Return an error if it doesn't exist or isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	node, err := f.srv.Get(ctx, f.absPath(dir), drive.FolderKind)
+	node, err := f.wrappedGet(ctx, f.absPath(dir), drive.FolderKind)
 	if err != nil {
 		return errors.Wrap(err, "Rmdir error")
 	}
-	return f.srv.Remove(ctx, node)
+	err = f.srv.Remove(ctx, node)
+	fs.Debugf(nil, "aliyundrive rmdir - path: %q, error: %v", dir, err)
+	return err
 }
 
 // Copy src to this remote using server-side copy operations.
@@ -278,11 +306,12 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	dstName := path.Base(dstPath)
 	err = f.srv.Copy(ctx, srcObj.info, dstParent, dstName)
+	fs.Debugf(nil, "aliyundrive copy - src path: %q, dest path: %q, error: %v", srcObj.remote, dstPath, err)
 	if err != nil {
 		return nil, errors.Wrap(err, "Copy error")
 	}
 
-	copiedNode, err := f.srv.Get(ctx, dstPath, drive.FileKind)
+	copiedNode, err := f.wrappedGet(ctx, dstPath, drive.FileKind)
 	if err != nil {
 		return nil, errors.Wrap(err, "Copy error, failed to get copied node")
 	}
@@ -324,7 +353,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, errors.Wrap(err, "Move error")
 	}
 
-	movedNode, err := f.srv.Get(ctx, dstPath, drive.FileKind)
+	movedNode, err := f.wrappedGet(ctx, dstPath, drive.FileKind)
 	if err != nil {
 		return nil, errors.Wrap(err, "Move error, failed to get moved node")
 	}
@@ -353,7 +382,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	}
 
 	srcPath := srcFs.absPath(srcRemote)
-	srcNode, err := f.srv.Get(ctx, srcPath, drive.FolderKind)
+	srcNode, err := f.wrappedGet(ctx, srcPath, drive.FolderKind)
 	if err != nil {
 		fs.Debugf(src, "Can't move directory - can't find srcNode")
 		return fs.ErrorCantDirMove
@@ -462,6 +491,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	node, err := o.fs.srv.CreateFileWithProof(ctx, p, src.Size(), in, sha1Code, proofCode, true)
+	fs.Debugf(nil, "aliyundrive create - path: %q, error: %v", p, err)
 	if err != nil {
 		return err
 	}
