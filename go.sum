@@ -63,8 +63,8 @@ github.com/BurntSushi/toml v0.3.1 h1:WXkYYl6Yr3qBf1K79EBnL4mak0OimBfB0XUf9Vl28OQ
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
 github.com/Julusian/godocdown v0.0.0-20170816220326-6d19f8ff2df8/go.mod h1:INZr5t32rG59/5xeltqoCJoNY7e5x/3xoY9WSWVWg74=
-github.com/K265/aliyundrive-go v0.0.0-20210809081844-5976ef862fc3 h1:Dspg7ImNqBQF8Lsen+ya4WUVHOtUrMkXLJBo7FVVnQI=
-github.com/K265/aliyundrive-go v0.0.0-20210809081844-5976ef862fc3/go.mod h1:gSEZmEJhd+Qf03U/HVdAD+DfKmNMxxkPL6LQqzEojMM=
+github.com/K265/aliyundrive-go v0.0.0-20210825004413-75bf84d041b1 h1:GpXktD4lmcdZXgVnBi3CbZPm5Qp95s2jJhtByxc8FC8=
+github.com/K265/aliyundrive-go v0.0.0-20210825004413-75bf84d041b1/go.mod h1:gSEZmEJhd+Qf03U/HVdAD+DfKmNMxxkPL6LQqzEojMM=
 github.com/Knetic/govaluate v3.0.1-0.20171022003610-9aa49832a739+incompatible/go.mod h1:r7JcOSlj0wfOMncg0iLm8Leh48TZaKVeNIfJntJ2wa0=
 github.com/Microsoft/go-winio v0.4.14/go.mod h1:qXqCSQ3Xa7+6tgxaGTIe4Kpcdsi+P8jBhyzoq1bpyYA=
 github.com/Microsoft/go-winio v0.4.17 h1:iT12IBVClFevaf8PuVyi3UmZOVh4OqnaLxDTW2O6j3w=
