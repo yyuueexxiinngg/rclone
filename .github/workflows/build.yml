@@ -6,6 +6,11 @@ name: build
 
 # Trigger the workflow manually
 on:
+  push:
+    branches:
+      - '*'
+    tags:
+      - '*'
   workflow_dispatch:
     inputs:
       manual:
@@ -26,10 +31,6 @@ jobs:
             go: '1.16.x'
             gotags: cmount
             build_flags: '-include "^linux/"'
-            check: false
-            quicktest: false
-            racequicktest: false
-            librclonetest: false
             deploy: true
 
           - job_name: mac_amd64
@@ -37,8 +38,6 @@ jobs:
             go: '1.16.x'
             gotags: 'cmount'
             build_flags: '-include "^darwin/amd64" -cgo'
-            quicktest: false
-            racequicktest: false
             deploy: true
 
           - job_name: mac_arm64
@@ -54,8 +53,6 @@ jobs:
             gotags: cmount
             build_flags: '-include "^windows/amd64" -cgo'
             build_args: '-buildmode exe'
-            quicktest: false
-            racequicktest: false
             deploy: true
 
     name: ${{ matrix.job_name }}
@@ -139,40 +136,6 @@ jobs:
         shell: bash
         run: |
           make
-
-      - name: Run tests
-        shell: bash
-        run: |
-          make quicktest
-        if: matrix.quicktest
-
-      - name: Race test
-        shell: bash
-        run: |
-          make racequicktest
-        if: matrix.racequicktest
-
-      - name: Run librclone tests
-        shell: bash
-        run: |
-          make -C librclone/ctest test
-          make -C librclone/ctest clean
-          librclone/python/test_rclone.py
-        if: matrix.librclonetest
-
-      - name: Code quality test
-        shell: bash
-        run: |
-          make build_dep
-          make check
-        if: matrix.check
-
-      - name: Compile all architectures test
-        shell: bash
-        run: |
-          make
-          make compile_all
-        if: matrix.compile_all
 
       - name: Deploy built binaries
         shell: bash
