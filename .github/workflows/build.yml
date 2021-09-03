@@ -4,14 +4,8 @@
 
 name: build
 
-# Trigger the workflow on push or pull request
+# Trigger the workflow manually
 on:
-  push:
-    branches:
-      - '*'
-    tags:
-      - '*'
-  pull_request:
   workflow_dispatch:
     inputs:
       manual:
@@ -20,12 +14,11 @@ on:
 
 jobs:
   build:
-    if: ${{ github.repository == 'rclone/rclone' || github.event.inputs.manual }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        job_name: ['linux', 'mac_amd64', 'mac_arm64', 'windows_amd64', 'windows_386', 'other_os', 'go1.13', 'go1.14', 'go1.15']
+        job_name: ['linux', 'mac_amd64', 'mac_arm64', 'windows_amd64']
 
         include:
           - job_name: linux
@@ -33,10 +26,10 @@ jobs:
             go: '1.16.x'
             gotags: cmount
             build_flags: '-include "^linux/"'
-            check: true
-            quicktest: true
-            racequicktest: true
-            librclonetest: true
+            check: false
+            quicktest: false
+            racequicktest: false
+            librclonetest: false
             deploy: true
 
           - job_name: mac_amd64
@@ -44,8 +37,8 @@ jobs:
             go: '1.16.x'
             gotags: 'cmount'
             build_flags: '-include "^darwin/amd64" -cgo'
-            quicktest: true
-            racequicktest: true
+            quicktest: false
+            racequicktest: false
             deploy: true
 
           - job_name: mac_arm64
@@ -61,44 +54,9 @@ jobs:
             gotags: cmount
             build_flags: '-include "^windows/amd64" -cgo'
             build_args: '-buildmode exe'
-            quicktest: true
-            racequicktest: true
+            quicktest: false
+            racequicktest: false
             deploy: true
-
-          - job_name: windows_386
-            os: windows-latest
-            go: '1.16.x'
-            gotags: cmount
-            goarch: '386'
-            cgo: '1'
-            build_flags: '-include "^windows/386" -cgo'
-            build_args: '-buildmode exe'
-            quicktest: true
-            deploy: true
-
-          - job_name: other_os
-            os: ubuntu-latest
-            go: '1.16.x'
-            build_flags: '-exclude "^(windows/|darwin/|linux/)"'
-            compile_all: true
-            deploy: true
-
-          - job_name: go1.13
-            os: ubuntu-latest
-            go: '1.13.x'
-            quicktest: true
-
-          - job_name: go1.14
-            os: ubuntu-latest
-            go: '1.14.x'
-            quicktest: true
-            racequicktest: true
-
-          - job_name: go1.15
-            os: ubuntu-latest
-            go: '1.15.x'
-            quicktest: true
-            racequicktest: true
 
     name: ${{ matrix.job_name }}
 
@@ -226,10 +184,9 @@ jobs:
           RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
         # working-directory: '$(modulePath)'
         # Deploy binaries if enabled in config && not a PR && not a fork
-        if: matrix.deploy && github.head_ref == '' && github.repository == 'rclone/rclone'
+        if: matrix.deploy && github.head_ref == ''
 
   android:
-     if: ${{ github.repository == 'rclone/rclone' || github.event.inputs.manual }}
      timeout-minutes: 30
      name: "android-all"
      runs-on: ubuntu-latest
@@ -334,4 +291,4 @@ jobs:
          env:
            RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
          # Upload artifacts if not a PR && not a fork
-         if: github.head_ref == '' && github.repository == 'rclone/rclone'
+         if: github.head_ref == ''
