@@ -16,14 +16,17 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/pacer"
 )
 
 const (
 	maxFileNameLength = 1024
+	defaultMinSleep   = fs.Duration(10 * time.Millisecond)
 )
 
 // Register with Fs
@@ -42,6 +45,11 @@ you can find this by executing localStorage.token in the Chrome console`,
 			Help:    "for aliyun drive albums",
 			Default: false,
 		}, {
+			Name:     "pacer_min_sleep",
+			Default:  defaultMinSleep,
+			Help:     "Minimum time to sleep between API calls.",
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -52,9 +60,10 @@ you can find this by executing localStorage.token in the Chrome console`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	RefreshToken string               `config:"refresh_token"`
-	IsAlbum      bool                 `config:"is_album"`
-	Enc          encoder.MultiEncoder `config:"encoding"`
+	RefreshToken  string               `config:"refresh_token"`
+	IsAlbum       bool                 `config:"is_album"`
+	Enc           encoder.MultiEncoder `config:"encoding"`
+	PacerMinSleep fs.Duration          `config:"pacer_min_sleep"`
 }
 
 // Fs represents a remote aliyundrive server
@@ -66,11 +75,7 @@ type Fs struct {
 	features *fs.Features       // optional features
 	srv      drive.Fs           // the connection to the aliyundrive api
 	dirCache *dircache.DirCache // Map of directory path to directory id
-}
-
-// absPath return absolute path of remote
-func (f *Fs) absPath(remote string) string {
-	return path.Join("/", f.root, remote)
+	pacer    *fs.Pacer
 }
 
 // Object describes a aliyundrive object
@@ -78,6 +83,23 @@ type Object struct {
 	fs     *Fs    // what this object is part of
 	remote string // The remote path
 	node   *drive.Node
+}
+
+// shouldRetry determines whether a given err rates being retried
+func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	if err == nil {
+		return false, nil
+	}
+	if fserrors.ShouldRetry(err) {
+		return true, err
+	}
+	if strings.Contains(err.Error(), `got "429"`) {
+		return true, err
+	}
+	return false, err
 }
 
 // NewFs constructs an Fs from the path, bucket:path
@@ -98,7 +120,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
-	nodes, err := f.srv.List(ctx, pathID)
+	var nodes []drive.Node
+	err = f.pacer.Call(func() (bool, error) {
+		nodes, err = f.srv.List(ctx, pathID)
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
 		return "", false, err
 	}
@@ -115,12 +141,15 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
 	leaf = f.opt.Enc.FromStandardName(leaf)
-	nodeId, err := f.srv.CreateFolder(ctx, pathID, leaf)
+	err = f.pacer.Call(func() (bool, error) {
+		newID, err = f.srv.CreateFolder(ctx, pathID, leaf)
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
 		return "", err
 	}
 
-	return nodeId, nil
+	return newID, err
 }
 
 // newFs partially constructs Fs from the path
@@ -146,11 +175,12 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 	}
 
 	f := &Fs{
-		name: name,
-		root: root,
-		opt:  *opt,
-		ci:   ci,
-		srv:  srv,
+		name:  name,
+		root:  root,
+		opt:   *opt,
+		ci:    ci,
+		srv:   srv,
+		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(opt.PacerMinSleep), pacer.DecayConstant(1))),
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -222,7 +252,11 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, err
 	}
 
-	nodes, err := f.srv.List(ctx, directoryId)
+	var nodes []drive.Node
+	err = f.pacer.Call(func() (bool, error) {
+		nodes, err = f.srv.List(ctx, directoryId)
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -249,16 +283,21 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	leaf, directoryID, err := f.dirCache.FindPath(ctx, remote, false)
+	leaf, directoryId, err := f.dirCache.FindPath(ctx, remote, false)
 	if err != nil {
-		fs.Debugf(f, "NewObject dirCache.FindPath: %v", directoryID)
+		fs.Debugf(f, "NewObject dirCache.FindPath: %v", directoryId)
 		return nil, fs.ErrorObjectNotFound
 	}
 
-	nodes, err := f.srv.List(ctx, directoryID)
+	var nodes []drive.Node
+	err = f.pacer.Call(func() (bool, error) {
+		nodes, err = f.srv.List(ctx, directoryId)
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
 		return nil, err
 	}
+
 	for _, _node := range nodes {
 		node := _node
 		if node.Name == leaf && !node.IsDirectory() {
@@ -288,7 +327,11 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	switch err {
 	case nil:
 		if o, ok := existingObj.(*Object); ok {
-			if err := f.srv.Remove(ctx, o.node.NodeId); err != nil {
+			err = f.pacer.Call(func() (bool, error) {
+				err := f.srv.Remove(ctx, o.node.NodeId)
+				return f.shouldRetry(ctx, err)
+			})
+			if err != nil {
 				return nil, err
 			}
 		}
@@ -322,7 +365,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return err
 	}
 
-	err = f.srv.Remove(ctx, directoryId)
+	err = f.pacer.Call(func() (bool, error) {
+		err = f.srv.Remove(ctx, directoryId)
+		return f.shouldRetry(ctx, err)
+	})
 	f.dirCache.FlushDir(dir)
 	return err
 }
@@ -343,29 +389,33 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fs.ErrorCantCopy
 	}
 
-	dstParentId, err := f.dirCache.FindDir(ctx, remote, false)
+	leaf, dstParentId, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
-		fs.Errorf(nil, "Copy dirCache.FindDir: %v", err)
-		return nil, fs.ErrorCantCopy
+		return nil, err
 	}
+	leaf = f.opt.Enc.FromStandardName(leaf)
 
-	dstName := path.Base(remote)
-	nodeId, err := f.srv.Copy(ctx, srcObj.node.NodeId, dstParentId, dstName)
+	var nodeId string
+	err = f.pacer.Call(func() (bool, error) {
+		nodeId, err = f.srv.Copy(ctx, srcObj.node.NodeId, dstParentId, leaf)
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
-		fs.Errorf(nil, "Copy copy: %v", err)
-		return nil, fs.ErrorCantCopy
-	}
-
-	node, err := f.srv.Get(ctx, nodeId)
-	if err != nil {
-		return nil, fs.ErrorCantCopy
+		return nil, err
 	}
 
 	dstObj := &Object{
 		fs:     f,
 		remote: remote,
-		node:   node,
 	}
+	err = f.pacer.Call(func() (bool, error) {
+		dstObj.node, err = f.srv.Get(ctx, nodeId)
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return dstObj, nil
 }
 
@@ -387,28 +437,31 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	leaf, dstParentId, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
-		fs.Errorf(nil, "Move dirCache.FindPath: %v", err)
-		return nil, fs.ErrorCantMove
+		return nil, err
 	}
-
 	leaf = f.opt.Enc.FromStandardName(leaf)
-	nodeId, err := f.srv.Move(ctx, srcObj.node.NodeId, dstParentId, leaf)
-	if err != nil {
-		fs.Errorf(nil, "Move move: %v", err)
-		return nil, fs.ErrorCantMove
-	}
 
-	node, err := f.srv.Get(ctx, nodeId)
+	var nodeId string
+	err = f.pacer.Call(func() (bool, error) {
+		nodeId, err = f.srv.Move(ctx, srcObj.node.NodeId, dstParentId, leaf)
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
-		fs.Errorf(nil, "Move get: %v", err)
-		return nil, fs.ErrorCantMove
+		return nil, err
 	}
 
 	dstObj := &Object{
 		fs:     f,
 		remote: remote,
-		node:   node,
 	}
+	err = f.pacer.Call(func() (bool, error) {
+		dstObj.node, err = f.srv.Get(ctx, nodeId)
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return dstObj, nil
 }
 
@@ -427,18 +480,17 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return fs.ErrorCantDirMove
 	}
 
-	srcID, _, _, dstDirectoryID, _, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+	srcID, _, _, dstDirectoryId, _, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
-		fs.Errorf(nil, "DirMove dirCache.DirMove: %v", err)
-		return fs.ErrorCantDirMove
+		return err
 	}
 
-	dstPath := f.absPath(dstRemote)
-	dstName := path.Base(dstPath)
-	_, err = f.srv.Move(ctx, srcID, dstDirectoryID, dstName)
+	err = f.pacer.Call(func() (bool, error) {
+		_, err = f.srv.Move(ctx, srcID, dstDirectoryId, path.Base(dstRemote))
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
-		fs.Errorf(nil, "DirMove move: %v", err)
-		return fs.ErrorCantDirMove
+		return err
 	}
 
 	return nil
@@ -494,11 +546,19 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 }
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
-func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	fs.FixRangeOption(options, o.Size())
 	headers := map[string]string{}
 	fs.OpenOptionAddHeaders(options, headers)
-	return o.fs.srv.Open(ctx, o.node.NodeId, headers)
+	err = o.fs.pacer.Call(func() (bool, error) {
+		in, err = o.fs.srv.Open(ctx, o.node.NodeId, headers)
+		return o.fs.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return in, err
 }
 
 const rapidUploadLimit = 50 * 1024 * 1024 // 50 MB
@@ -526,28 +586,38 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	// Create the directory for the object if it doesn't exist
-	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, o.Remote(), true)
+	leaf, directoryId, err := o.fs.dirCache.FindPath(ctx, o.Remote(), true)
 	if err != nil {
 		return err
 	}
 
-	nodeId, err := o.fs.srv.CreateFileWithProof(ctx, directoryID, leaf, src.Size(), in, sha1Code, proofCode)
+	var nodeId string
+	err = o.fs.pacer.Call(func() (bool, error) {
+		nodeId, err = o.fs.srv.CreateFileWithProof(ctx, directoryId, leaf, src.Size(), in, sha1Code, proofCode)
+		return o.fs.shouldRetry(ctx, err)
+	})
 	if err != nil {
 		return err
 	}
 
-	node, err := o.fs.srv.Get(ctx, nodeId)
+	err = o.fs.pacer.Call(func() (bool, error) {
+		o.node, err = o.fs.srv.Get(ctx, nodeId)
+		return o.fs.shouldRetry(ctx, err)
+	})
 	if err != nil {
 		return err
 	}
 
-	o.node = node
 	return nil
 }
 
 // Remove an object
-func (o *Object) Remove(ctx context.Context) error {
-	return o.fs.srv.Remove(ctx, o.node.NodeId)
+func (o *Object) Remove(ctx context.Context) (err error) {
+	err = o.fs.pacer.Call(func() (bool, error) {
+		err = o.fs.srv.Remove(ctx, o.node.NodeId)
+		return o.fs.shouldRetry(ctx, err)
+	})
+	return err
 }
 
 // Check the interfaces are satisfied
