@@ -496,6 +496,16 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return nil
 }
 
+// Purge all files in the directory specified
+//
+// Implement this if you have a way of deleting all the files
+// quicker than just running Remove() on the result of List()
+//
+// Return an error if it doesn't exist
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.Rmdir(ctx, dir)
+}
+
 // String returns a description of the Object
 func (o *Object) String() string {
 	if o == nil {
@@ -626,5 +636,6 @@ var (
 	_ fs.Copier   = (*Fs)(nil)
 	_ fs.Mover    = (*Fs)(nil)
 	_ fs.DirMover = (*Fs)(nil)
+	_ fs.Purger   = (*Fs)(nil)
 	_ fs.Object   = (*Object)(nil)
 )
