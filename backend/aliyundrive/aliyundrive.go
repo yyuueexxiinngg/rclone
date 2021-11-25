@@ -96,7 +96,7 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 	if fserrors.ShouldRetry(err) {
 		return true, err
 	}
-	if strings.Contains(err.Error(), `got "429"`) {
+	if strings.Contains(err.Error(), `429 Too Many Requests`) {
 		return true, err
 	}
 	return false, err
@@ -322,30 +322,11 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Temporary Object under construction
-	existingObj, err := f.NewObject(ctx, src.Remote())
-	switch err {
-	case nil:
-		if o, ok := existingObj.(*Object); ok {
-			err = f.pacer.Call(func() (bool, error) {
-				err := f.srv.Remove(ctx, o.node.NodeId)
-				return f.shouldRetry(ctx, err)
-			})
-			if err != nil {
-				return nil, err
-			}
-		}
-		return existingObj, existingObj.Update(ctx, in, src, options...)
-	case fs.ErrorObjectNotFound:
-		// Not found so create it
-		o := &Object{
-			fs:     f,
-			remote: src.Remote(),
-		}
-		return o, o.Update(ctx, in, src, options...)
-	default:
-		return nil, err
+	o := &Object{
+		fs:     f,
+		remote: src.Remote(),
 	}
+	return o, o.Update(ctx, in, src, options...)
 }
 
 // Mkdir makes the directory (container, bucket)
@@ -579,6 +560,16 @@ const rapidUploadLimit = 50 * 1024 * 1024 // 50 MB
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	if o.node != nil && o.node.NodeId != "" {
+		err := o.fs.pacer.Call(func() (bool, error) {
+			err := o.fs.srv.Remove(ctx, o.node.NodeId)
+			return o.fs.shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return err
+		}
+	}
+
 	sha1Code := ""
 	proofCode := ""
 	fileSize := src.Size()
