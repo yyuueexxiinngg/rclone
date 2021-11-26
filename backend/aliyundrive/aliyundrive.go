@@ -71,7 +71,6 @@ type Fs struct {
 	name     string             // name of this remote
 	root     string             // the path we are working on if any
 	opt      Options            // parsed config options
-	ci       *fs.ConfigInfo     // global config
 	features *fs.Features       // optional features
 	srv      drive.Fs           // the connection to the aliyundrive api
 	dirCache *dircache.DirCache // Map of directory path to directory id
@@ -161,12 +160,13 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		return nil, err
 	}
 
-	ci := fs.GetConfig(ctx)
-
 	conf := &drive.Config{
 		RefreshToken: opt.RefreshToken,
 		IsAlbum:      opt.IsAlbum,
 		HttpClient:   fshttp.NewClient(ctx),
+		OnRefreshToken: func(refreshToken string) {
+			m.Set("refresh_token", refreshToken)
+		},
 	}
 
 	srv, err := drive.NewFs(ctx, conf)
@@ -178,7 +178,6 @@ func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, err
 		name:  name,
 		root:  root,
 		opt:   *opt,
-		ci:    ci,
 		srv:   srv,
 		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(opt.PacerMinSleep), pacer.DecayConstant(1))),
 	}

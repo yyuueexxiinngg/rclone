@@ -8,7 +8,7 @@ require (
 	github.com/Azure/azure-storage-blob-go v0.13.0
 	github.com/Azure/go-autorest/autorest/adal v0.9.13
 	github.com/Azure/go-ntlmssp v0.0.0-20200615164410-66371956d46c
-	github.com/K265/aliyundrive-go v0.0.0-20211125061154-110a413f6805
+	github.com/K265/aliyundrive-go v0.0.0-20211126023047-99f65be7f66c
 	github.com/Microsoft/go-winio v0.4.17 // indirect
 	github.com/StackExchange/wmi v0.0.0-20210224194228-fe8f1750fd46 // indirect
 	github.com/Unknwon/goconfig v0.0.0-20200908083735-df7de6a44db8
