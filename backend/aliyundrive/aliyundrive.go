@@ -9,10 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/K265/aliyundrive-go/pkg/aliyun/drive"
-	"github.com/pkg/errors"
 	"github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -21,11 +19,14 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/pacer"
 )
 
 const (
 	maxFileNameLength = 1024
+	defaultMinSleep   = fs.Duration(10 * time.Millisecond)
 )
 
 // Register with Fs
@@ -44,6 +45,11 @@ you can find this by executing localStorage.token in the Chrome console`,
 			Help:    "for aliyun drive albums",
 			Default: false,
 		}, {
+			Name:     "pacer_min_sleep",
+			Default:  defaultMinSleep,
+			Help:     "Minimum time to sleep between API calls.",
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -54,34 +60,99 @@ you can find this by executing localStorage.token in the Chrome console`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	RefreshToken string `config:"refresh_token"`
-	IsAlbum      bool   `config:"is_album"`
+	RefreshToken  string               `config:"refresh_token"`
+	IsAlbum       bool                 `config:"is_album"`
+	Enc           encoder.MultiEncoder `config:"encoding"`
+	PacerMinSleep fs.Duration          `config:"pacer_min_sleep"`
 }
 
 // Fs represents a remote aliyundrive server
 type Fs struct {
-	name     string         // name of this remote
-	root     string         // the path we are working on if any
-	opt      Options        // parsed config options
-	ci       *fs.ConfigInfo // global config
-	features *fs.Features   // optional features
-	srv      drive.Fs       // the connection to the aliyundrive api
-}
-
-// absPath return absolute path of remote
-func (f *Fs) absPath(remote string) string {
-	return path.Join("/", f.root, remote)
+	name     string             // name of this remote
+	root     string             // the path we are working on if any
+	opt      Options            // parsed config options
+	features *fs.Features       // optional features
+	srv      drive.Fs           // the connection to the aliyundrive api
+	dirCache *dircache.DirCache // Map of directory path to directory id
+	pacer    *fs.Pacer
 }
 
 // Object describes a aliyundrive object
 type Object struct {
 	fs     *Fs    // what this object is part of
 	remote string // The remote path
-	info   *drive.Node
+	node   *drive.Node
+}
+
+// shouldRetry determines whether a given err rates being retried
+func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	if err == nil {
+		return false, nil
+	}
+	if fserrors.ShouldRetry(err) {
+		return true, err
+	}
+	if strings.Contains(err.Error(), `429 Too Many Requests`) {
+		return true, err
+	}
+	return false, err
 }
 
 // NewFs constructs an Fs from the path, bucket:path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+	f, err := newFs(ctx, name, root, m)
+	if f == nil {
+		return f, err
+	}
+
+	rootNode, err2 := f.srv.GetByPath(ctx, "", drive.FolderKind)
+	if err2 != nil {
+		return nil, err2
+	}
+
+	f.dirCache = dircache.New(f.root, rootNode.NodeId, f)
+	return f, err
+}
+
+// FindLeaf finds a directory of name leaf in the folder with ID pathID
+func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
+	var nodes []drive.Node
+	err = f.pacer.Call(func() (bool, error) {
+		nodes, err = f.srv.List(ctx, pathID)
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return "", false, err
+	}
+
+	for _, node := range nodes {
+		if node.IsDirectory() && node.Name == leaf {
+			return node.NodeId, true, nil
+		}
+	}
+
+	return "", false, nil
+}
+
+// CreateDir makes a directory with pathID as parent and name leaf
+func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
+	leaf = f.opt.Enc.FromStandardName(leaf)
+	err = f.pacer.Call(func() (bool, error) {
+		newID, err = f.srv.CreateFolder(ctx, pathID, leaf)
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return newID, err
+}
+
+// newFs partially constructs Fs from the path
+func newFs(ctx context.Context, name, root string, m configmap.Mapper) (*Fs, error) {
 	// Parse conf into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -89,25 +160,26 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
-	ci := fs.GetConfig(ctx)
-
 	conf := &drive.Config{
 		RefreshToken: opt.RefreshToken,
 		IsAlbum:      opt.IsAlbum,
 		HttpClient:   fshttp.NewClient(ctx),
+		OnRefreshToken: func(refreshToken string) {
+			m.Set("refresh_token", refreshToken)
+		},
 	}
 
 	srv, err := drive.NewFs(ctx, conf)
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't create aliyundrive api srv")
+		return nil, err
 	}
 
 	f := &Fs{
-		name: name,
-		root: root,
-		opt:  *opt,
-		ci:   ci,
-		srv:  srv,
+		name:  name,
+		root:  root,
+		opt:   *opt,
+		srv:   srv,
+		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(opt.PacerMinSleep), pacer.DecayConstant(1))),
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -118,7 +190,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	// refer from https://github.com/rclone/rclone/blob/v1.56.0/backend/local/local.go#L286
 	// Check to see if this points to a file
-	node, err := f.wrappedGet(ctx, f.root, drive.AnyKind)
+	node, err := f.srv.GetByPath(ctx, f.root, drive.AnyKind)
 	if err == nil && !node.IsDirectory() {
 		// It is a file, so use the parent as the root
 		f.root = filepath.Dir(f.root)
@@ -174,22 +246,32 @@ func getNodeModTime(node *drive.Node) time.Time {
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	nodes, err := f.srv.List(ctx, f.absPath(dir))
-	fs.Debugf(nil, "aliyundrive list - path: %q, error: %v ", dir, err)
+	directoryId, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
+	}
+
+	var nodes []drive.Node
+	err = f.pacer.Call(func() (bool, error) {
+		nodes, err = f.srv.List(ctx, directoryId)
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	for _, _node := range nodes {
 		node := _node
-		remote := path.Join(dir, node.GetName())
+		remote := path.Join(dir, node.Name)
 		if node.IsDirectory() {
+			// cache the directory ID for later lookups
+			f.dirCache.Put(remote, node.NodeId)
 			entries = append(entries, fs.NewDir(remote, getNodeModTime(&node)))
 		} else {
 			o := &Object{
 				fs:     f,
 				remote: remote,
-				info:   &node,
+				node:   &node,
 			}
 			entries = append(entries, o)
 		}
@@ -200,25 +282,33 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	node, err := f.wrappedGet(ctx, f.absPath(remote), drive.AnyKind)
+	leaf, directoryId, err := f.dirCache.FindPath(ctx, remote, false)
+	if err != nil {
+		fs.Debugf(f, "NewObject dirCache.FindPath: %v", directoryId)
+		return nil, fs.ErrorObjectNotFound
+	}
+
+	var nodes []drive.Node
+	err = f.pacer.Call(func() (bool, error) {
+		nodes, err = f.srv.List(ctx, directoryId)
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
 		return nil, err
 	}
-	o := &Object{
-		fs:     f,
-		remote: remote,
-		info:   node,
-	}
-	return o, nil
-}
 
-func (f *Fs) wrappedGet(ctx context.Context, path string, kind string) (*drive.Node, error) {
-	node, err := f.srv.Get(ctx, path, kind)
-	fs.Debugf(nil, "aliyundrive get - path: %q, kind: %s, error: %v", path, kind, err)
-	if err != nil && errors.Is(err, os.ErrNotExist) {
-		return nil, fs.ErrorObjectNotFound
+	for _, _node := range nodes {
+		node := _node
+		if node.Name == leaf && !node.IsDirectory() {
+			return &Object{
+				fs:     f,
+				remote: remote,
+				node:   &node,
+			}, nil
+		}
 	}
-	return node, err
+
+	return nil, fs.ErrorObjectNotFound
 }
 
 // Put in to the remote path with the modTime given of the given size
@@ -231,40 +321,18 @@ func (f *Fs) wrappedGet(ctx context.Context, path string, kind string) (*drive.N
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Temporary Object under construction
-	fs1 := &Object{
+	o := &Object{
 		fs:     f,
 		remote: src.Remote(),
 	}
-	return fs1, fs1.Update(ctx, in, src, options...)
-}
-
-// from dropbox.go
-func checkPathLength(name string) (err error) {
-	for next := ""; len(name) > 0; name = next {
-		if slash := strings.IndexRune(name, '/'); slash >= 0 {
-			name, next = name[:slash], name[slash+1:]
-		} else {
-			next = ""
-		}
-		length := utf8.RuneCountInString(name)
-		if length > maxFileNameLength {
-			return fserrors.NoRetryError(fs.ErrorFileNameTooLong)
-		}
-	}
-	return nil
+	return o, o.Update(ctx, in, src, options...)
 }
 
 // Mkdir makes the directory (container, bucket)
 //
 // Shouldn't return an error if it already exists
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	p := f.absPath(dir)
-	if cErr := checkPathLength(p); cErr != nil {
-		return cErr
-	}
-	_, err := f.srv.CreateFolder(ctx, p)
-	fs.Debugf(nil, "aliyundrive mkdir - path: %q, error: %v", dir, err)
+	_, err := f.dirCache.FindDir(ctx, dir, true)
 	return err
 }
 
@@ -272,12 +340,16 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 //
 // Return an error if it doesn't exist or isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	node, err := f.wrappedGet(ctx, f.absPath(dir), drive.FolderKind)
+	directoryId, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
-		return errors.Wrap(err, "Rmdir error")
+		return err
 	}
-	err = f.srv.Remove(ctx, node)
-	fs.Debugf(nil, "aliyundrive rmdir - path: %q, error: %v", dir, err)
+
+	err = f.pacer.Call(func() (bool, error) {
+		err = f.srv.Remove(ctx, directoryId)
+		return f.shouldRetry(ctx, err)
+	})
+	f.dirCache.FlushDir(dir)
 	return err
 }
 
@@ -293,34 +365,37 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
-		fs.Debugf(src, "Can't copy - not same remote type")
+		fs.Errorf(src, "Can't copy - not same remote type")
 		return nil, fs.ErrorCantCopy
 	}
 
-	dstPath := f.absPath(remote)
-	dstParent, err := f.srv.CreateFolder(ctx, path.Dir(dstPath))
+	leaf, dstParentId, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
-		fs.Debugf(src, "Can't copy - can't create or find remote node")
-		return nil, fs.ErrorCantCopy
+		return nil, err
 	}
+	leaf = f.opt.Enc.FromStandardName(leaf)
 
-	dstName := path.Base(dstPath)
-	err = f.srv.Copy(ctx, srcObj.info, dstParent, dstName)
-	fs.Debugf(nil, "aliyundrive copy - src path: %q, dest path: %q, error: %v", srcObj.remote, dstPath, err)
+	var nodeId string
+	err = f.pacer.Call(func() (bool, error) {
+		nodeId, err = f.srv.Copy(ctx, srcObj.node.NodeId, dstParentId, leaf)
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
-		return nil, errors.Wrap(err, "Copy error")
-	}
-
-	copiedNode, err := f.wrappedGet(ctx, dstPath, drive.FileKind)
-	if err != nil {
-		return nil, errors.Wrap(err, "Copy error, failed to get copied node")
+		return nil, err
 	}
 
 	dstObj := &Object{
 		fs:     f,
 		remote: remote,
-		info:   copiedNode,
 	}
+	err = f.pacer.Call(func() (bool, error) {
+		dstObj.node, err = f.srv.Get(ctx, nodeId)
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return dstObj, nil
 }
 
@@ -336,33 +411,37 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
-		fs.Debugf(src, "Can't move - not same remote type")
+		fs.Errorf(src, "Can't move - not same remote type")
 		return nil, fs.ErrorCantMove
 	}
 
-	dstPath := f.absPath(remote)
-	parent, err := f.srv.CreateFolder(ctx, path.Dir(dstPath))
+	leaf, dstParentId, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
-		fs.Debugf(src, "Can't move - can't create or find remote node")
-		return nil, fs.ErrorCantMove
+		return nil, err
 	}
+	leaf = f.opt.Enc.FromStandardName(leaf)
 
-	dstName := path.Base(dstPath)
-	err = f.srv.Move(ctx, srcObj.info, parent, dstName)
+	var nodeId string
+	err = f.pacer.Call(func() (bool, error) {
+		nodeId, err = f.srv.Move(ctx, srcObj.node.NodeId, dstParentId, leaf)
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
-		return nil, errors.Wrap(err, "Move error")
-	}
-
-	movedNode, err := f.wrappedGet(ctx, dstPath, drive.FileKind)
-	if err != nil {
-		return nil, errors.Wrap(err, "Move error, failed to get moved node")
+		return nil, err
 	}
 
 	dstObj := &Object{
 		fs:     f,
 		remote: remote,
-		info:   movedNode,
 	}
+	err = f.pacer.Call(func() (bool, error) {
+		dstObj.node, err = f.srv.Get(ctx, nodeId)
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return dstObj, nil
 }
 
@@ -377,31 +456,34 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
 	srcFs, ok := src.(*Fs)
 	if !ok {
-		fs.Debugf(srcFs, "Can't move directory - not same remote type")
+		fs.Errorf(srcFs, "Can't move directory - not same remote type")
 		return fs.ErrorCantDirMove
 	}
 
-	srcPath := srcFs.absPath(srcRemote)
-	srcNode, err := f.wrappedGet(ctx, srcPath, drive.FolderKind)
+	srcID, _, _, dstDirectoryId, _, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
-		fs.Debugf(src, "Can't move directory - can't find srcNode")
-		return fs.ErrorCantDirMove
+		return err
 	}
 
-	dstPath := f.absPath(dstRemote)
-	parent, err := f.srv.CreateFolder(ctx, path.Dir(dstPath))
+	err = f.pacer.Call(func() (bool, error) {
+		_, err = f.srv.Move(ctx, srcID, dstDirectoryId, path.Base(dstRemote))
+		return f.shouldRetry(ctx, err)
+	})
 	if err != nil {
-		fs.Debugf(src, "Can't move - can't create or find remote node")
-		return fs.ErrorCantMove
-	}
-
-	dstName := path.Base(dstPath)
-	err = f.srv.Move(ctx, srcNode, parent, dstName)
-	if err != nil {
-		return errors.Wrap(err, "Move error")
+		return err
 	}
 
 	return nil
+}
+
+// Purge all files in the directory specified
+//
+// Implement this if you have a way of deleting all the files
+// quicker than just running Remove() on the result of List()
+//
+// Return an error if it doesn't exist
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.Rmdir(ctx, dir)
 }
 
 // String returns a description of the Object
@@ -420,12 +502,12 @@ func (o *Object) Remote() string {
 // ModTime returns the modification date of the file
 // It should return a best guess if one isn't available
 func (o *Object) ModTime(context.Context) time.Time {
-	return getNodeModTime(o.info)
+	return getNodeModTime(o.node)
 }
 
 // Size returns the size of the file
 func (o *Object) Size() int64 {
-	return o.info.Size
+	return o.node.Size
 }
 
 // Fs returns read only access to the Fs that this object is part of
@@ -440,7 +522,7 @@ func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 		return "", hash.ErrUnsupported
 	}
 
-	return strings.ToLower(o.info.Hash), nil
+	return strings.ToLower(o.node.Hash), nil
 }
 
 // Storable says whether this object can be stored
@@ -454,11 +536,19 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 }
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
-func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	fs.FixRangeOption(options, o.Size())
 	headers := map[string]string{}
 	fs.OpenOptionAddHeaders(options, headers)
-	return o.fs.srv.Open(ctx, o.info, headers)
+	err = o.fs.pacer.Call(func() (bool, error) {
+		in, err = o.fs.srv.Open(ctx, o.node.NodeId, headers)
+		return o.fs.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return in, err
 }
 
 const rapidUploadLimit = 50 * 1024 * 1024 // 50 MB
@@ -469,6 +559,16 @@ const rapidUploadLimit = 50 * 1024 * 1024 // 50 MB
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	if o.node != nil && o.node.NodeId != "" {
+		err := o.fs.pacer.Call(func() (bool, error) {
+			err := o.fs.srv.Remove(ctx, o.node.NodeId)
+			return o.fs.shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return err
+		}
+	}
+
 	sha1Code := ""
 	proofCode := ""
 	fileSize := src.Size()
@@ -485,23 +585,39 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 
-	p := o.fs.absPath(o.Remote())
-	if cErr := checkPathLength(p); cErr != nil {
-		return cErr
-	}
-
-	node, err := o.fs.srv.CreateFileWithProof(ctx, p, src.Size(), in, sha1Code, proofCode, true)
-	fs.Debugf(nil, "aliyundrive create - path: %q, error: %v", p, err)
+	// Create the directory for the object if it doesn't exist
+	leaf, directoryId, err := o.fs.dirCache.FindPath(ctx, o.Remote(), true)
 	if err != nil {
 		return err
 	}
-	o.info = node
+
+	var nodeId string
+	err = o.fs.pacer.Call(func() (bool, error) {
+		nodeId, err = o.fs.srv.CreateFileWithProof(ctx, directoryId, leaf, src.Size(), in, sha1Code, proofCode)
+		return o.fs.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return err
+	}
+
+	err = o.fs.pacer.Call(func() (bool, error) {
+		o.node, err = o.fs.srv.Get(ctx, nodeId)
+		return o.fs.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
 // Remove an object
-func (o *Object) Remove(ctx context.Context) error {
-	return o.fs.srv.Remove(ctx, o.info)
+func (o *Object) Remove(ctx context.Context) (err error) {
+	err = o.fs.pacer.Call(func() (bool, error) {
+		err = o.fs.srv.Remove(ctx, o.node.NodeId)
+		return o.fs.shouldRetry(ctx, err)
+	})
+	return err
 }
 
 // Check the interfaces are satisfied
@@ -510,5 +626,6 @@ var (
 	_ fs.Copier   = (*Fs)(nil)
 	_ fs.Mover    = (*Fs)(nil)
 	_ fs.DirMover = (*Fs)(nil)
+	_ fs.Purger   = (*Fs)(nil)
 	_ fs.Object   = (*Object)(nil)
 )
